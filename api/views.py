@@ -1,7 +1,5 @@
-from django.shortcuts import render
+# api/views.py
 
-# Create your views here.
-import pandas as pd
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -10,6 +8,7 @@ from .serializers import CustomerSerializer, LoanSerializer, LoanDetailSerialize
 from django.db.models import Sum
 from datetime import date
 import math
+import pandas as pd
 
 # Helper function to calculate credit score
 def calculate_credit_score(customer_id):
@@ -36,9 +35,6 @@ def calculate_credit_score(customer_id):
         return 0
 
     # A simple weighted scoring model. These weights can be adjusted.
-    # We will normalize these values to a score out of 100.
-    # For simplicity, we'll use a rule-based approach rather than complex normalization.
-    
     credit_score = 0
     
     if paid_on_time_component > 90:
@@ -57,7 +53,6 @@ def calculate_credit_score(customer_id):
     if total_loan_volume < customer.approved_limit * 0.5:
         credit_score += 25
     
-    # Cap score at 100
     return min(credit_score, 100)
 
 
@@ -69,13 +64,22 @@ class RegisterView(APIView):
         monthly_income = request.data.get('monthly_income')
         phone_number = request.data.get('phone_number')
 
-        # Basic validation
         if not all([first_name, last_name, age, monthly_income, phone_number]):
             return Response({"error": "All fields are required."}, status=status.HTTP_400_BAD_REQUEST)
 
         approved_limit = round(36 * monthly_income / 100000) * 100000
 
+        # --- FIX: Manually generate a new customer_id ---
+        # Find the highest existing customer_id and add 1
+        last_customer = Customer.objects.all().order_by('-customer_id').first()
+        if last_customer:
+            new_customer_id = last_customer.customer_id + 1
+        else:
+            # If there are no customers in the DB yet
+            new_customer_id = 1
+
         customer = Customer.objects.create(
+            customer_id=new_customer_id, # Provide the new ID
             first_name=first_name,
             last_name=last_name,
             age=age,
@@ -85,15 +89,22 @@ class RegisterView(APIView):
         )
         
         serializer = CustomerSerializer(customer)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        # In the response, combine first and last name as 'name'
+        response_data = serializer.data
+        response_data['name'] = f"{customer.first_name} {customer.last_name}"
+        response_data['monthly_income'] = response_data.pop('monthly_salary')
+        del response_data['first_name']
+        del response_data['last_name']
+        
+        return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 class CheckEligibilityView(APIView):
     def post(self, request):
         customer_id = request.data.get('customer_id')
-        loan_amount = request.data.get('loan_amount')
-        interest_rate = request.data.get('interest_rate')
-        tenure = request.data.get('tenure')
+        loan_amount = float(request.data.get('loan_amount'))
+        interest_rate = float(request.data.get('interest_rate'))
+        tenure = int(request.data.get('tenure'))
 
         try:
             customer = Customer.objects.get(customer_id=customer_id)
@@ -102,7 +113,6 @@ class CheckEligibilityView(APIView):
 
         credit_score = calculate_credit_score(customer_id)
         
-        # Check sum of current EMIs
         current_emis = Loan.objects.filter(customer=customer, end_date__gte=date.today()).aggregate(Sum('monthly_payment'))['monthly_payment__sum'] or 0
         if current_emis > customer.monthly_salary / 2:
             return Response({
@@ -142,10 +152,12 @@ class CheckEligibilityView(APIView):
                 "message": f"Loan not approved due to low credit score ({credit_score})."
             }, status=status.HTTP_200_OK)
 
-        # Calculate monthly installment (EMI)
-        # Using compound interest formula for EMI: P * r * (1+r)^n / ((1+r)^n - 1)
         monthly_rate = corrected_interest_rate / (12 * 100)
-        monthly_installment = (loan_amount * monthly_rate * (1 + monthly_rate)**tenure) / ((1 + monthly_rate)**tenure - 1)
+        if monthly_rate > 0:
+            monthly_installment = (loan_amount * monthly_rate * (1 + monthly_rate)**tenure) / ((1 + monthly_rate)**tenure - 1)
+        else:
+            monthly_installment = loan_amount / tenure
+
 
         return Response({
             "customer_id": customer_id,
@@ -157,9 +169,8 @@ class CheckEligibilityView(APIView):
         }, status=status.HTTP_200_OK)
 
 
-class CreateLoanView(CheckEligibilityView): # Inherits from CheckEligibilityView
+class CreateLoanView(CheckEligibilityView):
     def post(self, request):
-        # Run eligibility check first
         eligibility_response = super().post(request)
         
         if not eligibility_response.data.get('approval'):
@@ -171,7 +182,6 @@ class CreateLoanView(CheckEligibilityView): # Inherits from CheckEligibilityView
                 "monthly_installment": 0
             }, status=status.HTTP_200_OK)
 
-        # If approved, create the loan
         customer_id = request.data.get('customer_id')
         customer = Customer.objects.get(customer_id=customer_id)
         
